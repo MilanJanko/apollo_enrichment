@@ -58,25 +58,6 @@ Enrichment appended to original data (safe for re-import)
 Auto-save to server-side storage
 Manual download with custom filename
 
-Project structure
-.
-├── app.py                  # Streamlit application
-├── src/
-│   ├── pipeline.py         # Enrichment orchestration
-│   ├── apollo_client.py
-│   ├── apollo_org_search.py
-│   ├── apollo_search.py
-│   ├── apollo_enrich.py
-│   ├── decision_maker.py
-│   ├── domain_utils.py
-│   └── org_cache.py
-├── data/
-│   ├── uploads/            # Uploaded input files (gitignored)
-│   ├── outputs/            # Enriched outputs + checkpoints (gitignored)
-│   └── cache/              # Org search cache (gitignored)
-├── requirements.txt
-└── README.md
-
 Setup
 1. Create virtual environment
 python -m venv .venv

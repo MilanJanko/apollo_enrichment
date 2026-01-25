@@ -18,10 +18,12 @@ from .org_cache import OrgSearchCache
 
 
 DEFAULT_SENIORITIES = ["owner", "founder", "c_suite", "vp", "director"]
+RETRY_STATUSES = {"error", "no_enrich", "no_match"}
 
-RETRY_STATUSES = {"error", "no_enrich", "no_match"}  # retry only these
 
-
+# -------------------------------------------------
+# Helpers
+# -------------------------------------------------
 def extract_people_from_search(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
     if isinstance(resp.get("people"), list):
         return resp["people"]
@@ -43,11 +45,16 @@ def extract_enriched_person(resp: Dict[str, Any]) -> Dict[str, Any] | None:
     data = resp.get("data")
     if isinstance(data, dict) and isinstance(data.get("person"), dict):
         return data["person"]
-    if isinstance(data, dict) and any(k in data for k in ("email", "first_name", "last_name")):
+    if isinstance(data, dict) and any(
+        k in data for k in ("email", "first_name", "last_name")
+    ):
         return data
     return None
 
 
+# -------------------------------------------------
+# Output builder
+# -------------------------------------------------
 def build_output_row(
     *,
     source_row: int,
@@ -59,15 +66,19 @@ def build_output_row(
     note: str,
     org: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+
     first = candidate.get("first_name") or (enriched or {}).get("first_name")
     last = candidate.get("last_name") or (enriched or {}).get("last_name")
     title = candidate.get("title") or (enriched or {}).get("title")
     linkedin = candidate.get("linkedin_url") or (enriched or {}).get("linkedin_url")
-    person_id = candidate.get("id") or candidate.get("person_id") or (enriched or {}).get("id")
+    person_id = (
+        candidate.get("id")
+        or candidate.get("person_id")
+        or (enriched or {}).get("id")
+    )
 
     email = (enriched or {}).get("email") or (enriched or {}).get("email_address")
-
-    full_name = " ".join([p for p in [first, last] if p]) or None
+    full_name = " ".join(p for p in [first, last] if p) or None
 
     company_name = None
     employee_count = None
@@ -82,17 +93,14 @@ def build_output_row(
         "status": status,
         "note": note,
 
-        # source mapping
-        "source_row": source_row,               # 1-based original row index
+        "source_row": source_row,
         "source_website": source_website,
 
-        # org info
         "company_domain": company_domain,
         "organization_id": organization_id,
         "company_name": company_name,
         "employee_count": employee_count,
 
-        # person info
         "apollo_person_id": person_id,
         "first_name": first,
         "last_name": last,
@@ -103,13 +111,19 @@ def build_output_row(
     }
 
 
+# -------------------------------------------------
+# Core enrichment
+# -------------------------------------------------
 def enrich_one_company(
     client,
     cache: OrgSearchCache,
     *,
     source_row: int,
     website: str,
+    reveal_phone_number: bool = False,
+    webhook_url: Optional[str] = None,
 ) -> Dict[str, Any]:
+
     domain = normalize_domain(website)
     if not domain:
         return build_output_row(
@@ -123,7 +137,7 @@ def enrich_one_company(
             org=None,
         )
 
-    # STEP 0 — Org search (paid) but cached
+    # STEP 0 — Org search
     try:
         org = organization_search_by_domain(client, domain, cache)
     except ApolloHTTPError as e:
@@ -190,7 +204,9 @@ def enrich_one_company(
 
     candidate = best.raw
     person_id = candidate.get("id") or candidate.get("person_id")
-    full_name = " ".join(filter(None, [candidate.get("first_name"), candidate.get("last_name")])) or None
+    full_name = " ".join(
+        filter(None, [candidate.get("first_name"), candidate.get("last_name")])
+    ) or None
     linkedin = candidate.get("linkedin_url")
 
     # STEP 2 — Enrichment (paid)
@@ -202,6 +218,8 @@ def enrich_one_company(
             full_name=full_name,
             linkedin_url=linkedin,
             reveal_personal_emails=False,
+            reveal_phone_number=reveal_phone_number,
+            webhook_url=webhook_url,
         )
         enriched_person = extract_enriched_person(enrich_resp)
     except ApolloHTTPError as e:
@@ -240,12 +258,18 @@ def enrich_one_company(
     )
 
 
+# -------------------------------------------------
+# Checkpoint helpers
+# -------------------------------------------------
 def _save_checkpoint(path: str, state: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+# -------------------------------------------------
+# Batch enrichment
+# -------------------------------------------------
 def enrich_dataframe(
     df: pd.DataFrame,
     website_column: str,
@@ -254,11 +278,10 @@ def enrich_dataframe(
     end_row: int | None = None,
     progress_cb=None,
     checkpoint_path: str | None = None,
+    reveal_phone_number: bool = False,
+    webhook_url: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    start_row/end_row are 1-based inclusive.
-    Saves checkpoint after each row if checkpoint_path is provided.
-    """
+
     client = get_client_from_env()
     cache = OrgSearchCache("data/cache/org_cache.json")
 
@@ -266,42 +289,44 @@ def enrich_dataframe(
     start_idx = max(start_row - 1, 0)
     end_idx = min(end_row if end_row is not None else total_rows, total_rows)
 
-    if start_idx >= end_idx:
-        raise ValueError("Invalid row range selected.")
-
     subset = df.iloc[start_idx:end_idx].copy()
     websites = subset[website_column].astype(str).tolist()
 
-    total = len(websites)
     results: List[Dict[str, Any]] = []
 
     for i, website in enumerate(websites, start=1):
-        source_row = start_idx + i  # 1-based original row number
+        source_row = start_idx + i
+
         row_result = enrich_one_company(
             client,
             cache,
             source_row=source_row,
             website=website,
+            reveal_phone_number=reveal_phone_number,
+            webhook_url=webhook_url,
         )
         results.append(row_result)
 
         if progress_cb:
-            progress_cb(i / total, f"Enriched row {source_row} of {total_rows}")
+            progress_cb(i / len(websites), f"Enriched row {source_row}")
 
         if checkpoint_path:
-            state = {
-                "total_rows": total_rows,
-                "website_column": website_column,
-                "start_row": start_row,
-                "end_row": end_idx,
-                "last_completed_row": source_row,
-                "results_so_far": len(results),
-            }
-            _save_checkpoint(checkpoint_path, state)
+            _save_checkpoint(
+                checkpoint_path,
+                {
+                    "last_completed_row": source_row,
+                    "website_column": website_column,
+                    "start_row": start_row,
+                    "end_row": end_idx,
+                },
+            )
 
     return pd.DataFrame(results)
 
 
+# -------------------------------------------------
+# Retry failed only (UNCHANGED)
+# -------------------------------------------------
 def retry_failed_only(
     df_original: pd.DataFrame,
     website_column: str,
@@ -310,21 +335,19 @@ def retry_failed_only(
     progress_cb=None,
     checkpoint_path: str | None = None,
 ) -> pd.DataFrame:
-    """
-    Retries only failed rows from a previous output.
-    Uses source_row + source_website for mapping.
-    """
+
     client = get_client_from_env()
     cache = OrgSearchCache("data/cache/org_cache.json")
 
-    failed = previous_output_df[previous_output_df["status"].isin(RETRY_STATUSES)].copy()
+    failed = previous_output_df[
+        previous_output_df["status"].isin(RETRY_STATUSES)
+    ].copy()
+
     if failed.empty:
         return pd.DataFrame([])
 
-    # Use original row order
     failed.sort_values("source_row", inplace=True)
 
-    total = len(failed)
     results = []
 
     for i, r in enumerate(failed.itertuples(index=False), start=1):
@@ -340,34 +363,30 @@ def retry_failed_only(
         results.append(row_result)
 
         if progress_cb:
-            progress_cb(i / total, f"Retry {i}/{total} (row {source_row})")
+            progress_cb(i / len(failed), f"Retry row {source_row}")
 
         if checkpoint_path:
-            state = {
-                "mode": "retry_failed_only",
-                "website_column": website_column,
-                "last_completed_source_row": source_row,
-                "results_so_far": len(results),
-                "total_to_retry": total,
-            }
-            _save_checkpoint(checkpoint_path, state)
+            _save_checkpoint(
+                checkpoint_path,
+                {
+                    "mode": "retry_failed_only",
+                    "last_completed_source_row": source_row,
+                },
+            )
 
     return pd.DataFrame(results)
 
+
+# -------------------------------------------------
+# Merge back into original
+# -------------------------------------------------
 def append_enrichment_to_original_df(
     original_df: pd.DataFrame,
     enrichment_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Appends Apollo enrichment columns back into the original dataframe
-    using source_row (1-based).
-
-    Does NOT drop or reorder original columns.
-    """
 
     df = original_df.copy()
 
-    # Define output columns (safe, prefixed)
     column_map = {
         "full_name": "apollo_contact_name",
         "title": "apollo_contact_title",
@@ -379,52 +398,83 @@ def append_enrichment_to_original_df(
         "employee_count": "apollo_employee_count",
     }
 
-    # Ensure columns exist
-    for col in column_map.values():
+    phone_cols = {
+        "apollo_phone_number": "apollo_phone_number",
+        "apollo_phone_type": "apollo_phone_type",
+        "apollo_phone_status": "apollo_phone_status",
+    }
+
+    for col in list(column_map.values()) + list(phone_cols.values()):
         if col not in df.columns:
             df[col] = None
 
-    # Write back row by row
     for r in enrichment_df.itertuples(index=False):
         source_row = int(getattr(r, "source_row", 0))
         if source_row <= 0 or source_row > len(df):
             continue
 
-        idx = source_row - 1  # convert to 0-based
+        idx = source_row - 1
 
-        for src_col, target_col in column_map.items():
-            if hasattr(r, src_col):
-                value = getattr(r, src_col)
-                if value is not None:
-                    df.at[idx, target_col] = value
+        for src, tgt in column_map.items():
+            if hasattr(r, src):
+                v = getattr(r, src)
+                if v is not None:
+                    df.at[idx, tgt] = v
 
     return df
 
 
-def main():
-    load_dotenv()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--website_column", default="company_website")
-    parser.add_argument("--start_row", type=int, default=1)
-    parser.add_argument("--end_row", type=int, default=0)
-    args = parser.parse_args()
+# -------------------------------------------------
+# Phase 2 — merge phone events (async)
+# -------------------------------------------------
+def merge_phone_events_into_original_df(
+    df: pd.DataFrame,
+    phone_events_path: str = "data/phone_events.jsonl",
+) -> pd.DataFrame:
 
-    df = pd.read_csv(args.input)
-    end_row = None if args.end_row == 0 else args.end_row
+    if not os.path.exists(phone_events_path):
+        return df
 
-    out = enrich_dataframe(
-        df=df,
-        website_column=args.website_column,
-        start_row=args.start_row,
-        end_row=end_row,
-        progress_cb=None,
-    )
+    with open(phone_events_path, "r", encoding="utf-8") as f:
+        events = [json.loads(line) for line in f if line.strip()]
 
-    out.to_csv(args.output, index=False)
-    print(f"Saved: {args.output}")
+    phone_by_person: Dict[str, Dict[str, Any]] = {}
 
+    for e in events:
+        payload = e.get("payload", {})
+        people = payload.get("people", [])
 
-if __name__ == "__main__":
-    main()
+        if not isinstance(people, list):
+            continue
+
+        for p in people:
+            pid = p.get("id")
+            phones = p.get("phone_numbers") or []
+
+            if pid and phones:
+                phone_by_person[pid] = phones[0]  # best / first phone
+
+    if not phone_by_person:
+        return df
+
+    # Ensure columns exist
+    for col in [
+        "apollo_phone_number",
+        "apollo_phone_type",
+        "apollo_phone_status",
+    ]:
+        if col not in df.columns:
+            df[col] = None
+
+    for idx, row in df.iterrows():
+        pid = row.get("apollo_person_id")
+        phone = phone_by_person.get(pid)
+
+        if phone:
+            df.at[idx, "apollo_phone_number"] = (
+                phone.get("sanitized_number") or phone.get("raw_number")
+            )
+            df.at[idx, "apollo_phone_type"] = phone.get("type_cd")
+            df.at[idx, "apollo_phone_status"] = phone.get("status_cd")
+
+    return df
