@@ -4,3 +4,4 @@ data/outputs/
 data/cache/
 __pycache__/
 .venv/
+.DS_Store
