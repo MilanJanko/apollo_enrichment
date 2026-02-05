@@ -13,25 +13,38 @@ def people_enrichment_match(
     full_name: Optional[str] = None,
     linkedin_url: Optional[str] = None,
     reveal_personal_emails: bool = False,
+    reveal_phone_number: bool = False,
+    webhook_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Calls:
     POST /api/v1/people/match
 
-    Best practice for reliability:
-    - Use person_id + domain when available
+    IMPORTANT:
+    - Phone reveal is async
+    - webhook_url is REQUIRED when reveal_phone_number=True
     """
+
+    if reveal_phone_number and not webhook_url:
+        raise ValueError(
+            "webhook_url must be provided when reveal_phone_number=True"
+        )
+
     payload: Dict[str, Any] = {
         "reveal_personal_emails": bool(reveal_personal_emails),
+        "reveal_phone_number": bool(reveal_phone_number),
     }
+
+    if reveal_phone_number:
+        payload["webhook_url"] = webhook_url
 
     if person_id:
         payload["id"] = person_id
     if domain:
         payload["domain"] = domain
-    if full_name and not (payload.get("id") or payload.get("linkedin_url")):
-        payload["name"] = full_name
     if linkedin_url:
         payload["linkedin_url"] = linkedin_url
+    if full_name and not (person_id or linkedin_url):
+        payload["name"] = full_name
 
     return client._post("/people/match", payload)

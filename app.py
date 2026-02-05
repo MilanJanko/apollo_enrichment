@@ -11,6 +11,7 @@ from src.pipeline import (
     enrich_dataframe,
     retry_failed_only,
     append_enrichment_to_original_df,
+    merge_phone_events_into_original_df,
 )
 
 # -------------------------------------------------
@@ -18,26 +19,22 @@ from src.pipeline import (
 # -------------------------------------------------
 load_dotenv()
 
-st.set_page_config(
-    page_title="Apollo Company Enrichment",
-    layout="wide",
-)
-
-st.title("🔍 Apollo Company Enrichment")
-st.caption(
-    "Upload → select website column → select row range → enrich "
-    "→ append contact data → download"
-)
-
 UPLOAD_DIR = "data/uploads"
 OUTPUT_DIR = "data/outputs"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# -------------------------------------------------
-# Helpers
-# -------------------------------------------------
+
+def phone_progress(df: pd.DataFrame) -> tuple[int, int]:
+    if "apollo_person_id" not in df.columns:
+        return 0, 0
+
+    total = int(df["apollo_person_id"].notna().sum())
+    received = int(df["apollo_phone_number"].notna().sum()) if "apollo_phone_number" in df.columns else 0
+    return received, total
+
+
 def latest_checkpoint_file() -> str | None:
     files = sorted(glob.glob(os.path.join(OUTPUT_DIR, "checkpoint_*.json")))
     return files[-1] if files else None
@@ -48,213 +45,190 @@ def latest_output_csv() -> str | None:
     return files[-1] if files else None
 
 
+st.set_page_config(page_title="Apollo Company Enrichment", layout="wide")
+st.title("🔍 Apollo Company Enrichment")
+st.caption("Upload → select website column → select row range → enrich → download")
+
 # -------------------------------------------------
 # Sidebar
 # -------------------------------------------------
 with st.sidebar:
     st.header("⚙️ Apollo Info")
 
-    api_key = os.getenv("APOLLO_API_KEY")
-    if api_key:
+    if os.getenv("APOLLO_API_KEY"):
         st.success("Apollo API key loaded")
     else:
         st.error("APOLLO_API_KEY not found in .env")
 
     st.markdown("---")
-
     st.info(
         "ℹ️ **Credits notice**\n\n"
-        "Apollo credit balance is not reliably exposed via API.\n\n"
-        "Check remaining credits in:\n"
-        "**Apollo → Settings → Billing → Usage**"
+        "Phone number enrichment consumes credits.\n"
+        "Check remaining credits in Apollo dashboard."
     )
 
     st.markdown("---")
-
-    ckpt = latest_checkpoint_file()
-    if ckpt:
-        st.caption("Latest checkpoint found:")
-        st.code(ckpt)
+    debug_mode = st.checkbox("🧪 Debug mode (prints to terminal)", value=False)
 
 # -------------------------------------------------
-# Step 1 — Upload file
+# Step 1 — Upload
 # -------------------------------------------------
 st.header("1️⃣ Upload file")
 
-uploaded_file = st.file_uploader(
-    "Upload CSV or Excel file",
-    type=["csv", "xlsx"],
-)
-
+uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
 if not uploaded_file:
     st.stop()
 
-timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 upload_path = os.path.join(UPLOAD_DIR, f"{timestamp}_{uploaded_file.name}")
 
 with open(upload_path, "wb") as f:
     f.write(uploaded_file.getbuffer())
 
-st.success(f"File saved on server at `{upload_path}`")
-
-# Load dataframe
-if uploaded_file.name.endswith(".csv"):
-    original_df = pd.read_csv(uploaded_file)
-else:
-    original_df = pd.read_excel(uploaded_file)
+original_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
 
 st.subheader("Preview (first 10 rows)")
-st.dataframe(original_df.head(10), use_container_width=True)
+st.dataframe(original_df.head(10), width="stretch")
 
 total_rows = len(original_df)
-st.caption(f"Total rows in file: **{total_rows}**")
+st.caption(f"Total rows: **{total_rows}**")
 
 # -------------------------------------------------
-# Step 2 — Select website column
+# Step 2 — Website column
 # -------------------------------------------------
 st.header("2️⃣ Select website column")
-
-website_col = st.selectbox(
-    "Which column contains company websites?",
-    original_df.columns.tolist(),
-)
+website_col = st.selectbox("Which column contains company websites?", original_df.columns.tolist())
 
 # -------------------------------------------------
-# Step 3 — Select row range
+# Step 3 — Row range
 # -------------------------------------------------
 st.header("3️⃣ Select row range")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    start_row = st.number_input(
-        "Start row (1-based, inclusive)",
-        min_value=1,
-        max_value=total_rows,
-        value=1,
-        step=1,
-    )
-
-with col2:
-    end_row = st.number_input(
-        "End row (1-based, inclusive)",
-        min_value=1,
-        max_value=total_rows,
-        value=total_rows,
-        step=1,
-    )
+start_row = st.number_input("Start row (1-based)", 1, total_rows, 1)
+end_row = st.number_input("End row (1-based)", 1, total_rows, total_rows)
 
 if start_row > end_row:
-    st.error("Start row must be less than or equal to end row.")
+    st.error("Start row must be ≤ end row.")
     st.stop()
 
-rows_to_process = end_row - start_row + 1
+# -------------------------------------------------
+# Step 3.5 — Phones
+# -------------------------------------------------
+st.header("3️⃣➕ Phone numbers (optional)")
 
-st.caption(
-    f"🔢 This run will enrich **rows {start_row} → {end_row}** "
-    f"(**{rows_to_process} companies**)"
-)
+reveal_phone = st.checkbox("Reveal phone numbers (async, costs credits)", value=False)
+
+webhook_url = None
+if reveal_phone:
+    st.warning(
+        "📞 Phone enrichment is **asynchronous** and consumes credits.\n\n"
+        "Webhook + ngrok must be running."
+    )
+    webhook_url = st.text_input(
+        "Webhook URL",
+        placeholder="https://xxxx.ngrok.io/apollo/phone-webhook",
+    )
+    if not webhook_url:
+        st.stop()
 
 # -------------------------------------------------
-# Step 4 — Run / Resume
+# Step 4 — Run / Resume / Retry
 # -------------------------------------------------
 st.header("4️⃣ Run enrichment")
 
-run_clicked = st.button("🚀 Start enrichment", type="primary")
-resume_clicked = st.button("▶️ Resume last run from checkpoint")
+colA, colB, colC = st.columns(3)
+with colA:
+    run_clicked = st.button("🚀 Start enrichment", type="primary")
+with colB:
+    resume_clicked = st.button("▶️ Resume last run")
+with colC:
+    retry_clicked = st.button("🔁 Retry failed only")
 
 progress_bar = st.progress(0)
 status_text = st.empty()
+
 
 def progress_cb(pct, msg):
     progress_bar.progress(pct)
     status_text.info(msg)
 
-checkpoint_path = os.path.join(
-    OUTPUT_DIR, f"checkpoint_{timestamp}.json"
-)
 
-output_path = os.path.join(
-    OUTPUT_DIR,
-    f"enriched_{timestamp}_rows_{start_row}_{end_row}.csv",
-)
+checkpoint_path = os.path.join(OUTPUT_DIR, f"checkpoint_{timestamp}.json")
+output_path = os.path.join(OUTPUT_DIR, f"enriched_{timestamp}_rows_{start_row}_{end_row}.csv")
 
 enrichment_df = None
-merged_df = None
 
-# -------------------------------------------------
-# Resume logic
-# -------------------------------------------------
+# ---- Resume
 if resume_clicked:
     ckpt_file = latest_checkpoint_file()
     if not ckpt_file:
-        st.warning("No checkpoint found to resume.")
+        st.warning("No checkpoint found.")
         st.stop()
 
-    with open(ckpt_file, "r", encoding="utf-8") as f:
+    with open(ckpt_file, "r") as f:
         ckpt = json.load(f)
 
     resume_from = int(ckpt.get("last_completed_row", 0)) + 1
     resume_end = int(ckpt.get("end_row", end_row))
+    resume_col = ckpt.get("website_column", website_col)
 
-    if resume_from > resume_end:
-        st.success("Checkpoint indicates the run is already complete.")
+    enrichment_df = enrich_dataframe(
+        df=original_df,
+        website_column=resume_col,
+        start_row=resume_from,
+        end_row=resume_end,
+        progress_cb=progress_cb,
+        checkpoint_path=checkpoint_path,
+        reveal_phone_number=reveal_phone,
+        webhook_url=webhook_url,
+        debug=debug_mode,
+    )
+
+# ---- Fresh run
+if run_clicked:
+    enrichment_df = enrich_dataframe(
+        df=original_df,
+        website_column=website_col,
+        start_row=start_row,
+        end_row=end_row,
+        progress_cb=progress_cb,
+        checkpoint_path=checkpoint_path,
+        reveal_phone_number=reveal_phone,
+        webhook_url=webhook_url,
+        debug=debug_mode,
+    )
+
+# ---- Retry failed
+if retry_clicked:
+    latest_csv = latest_output_csv()
+    if not latest_csv:
+        st.warning("No previous output CSV found to retry from.")
         st.stop()
 
-    st.info(
-        f"Resuming from row **{resume_from} → {resume_end}** "
-        f"using checkpoint `{ckpt_file}`"
+    prev = pd.read_csv(latest_csv)
+    retry_df = retry_failed_only(
+        df_original=original_df,
+        website_column=website_col,
+        previous_output_df=prev,
+        progress_cb=progress_cb,
+        checkpoint_path=checkpoint_path,
+        reveal_phone_number=reveal_phone,
+        webhook_url=webhook_url,
+        debug=debug_mode,
     )
-
-    with st.spinner("Resuming enrichment…"):
-        enrichment_df = enrich_dataframe(
-            df=original_df,
-            website_column=ckpt.get("website_column", website_col),
-            start_row=resume_from,
-            end_row=resume_end,
-            progress_cb=progress_cb,
-            checkpoint_path=checkpoint_path,
-        )
+    enrichment_df = retry_df
 
 # -------------------------------------------------
-# Fresh run
+# Post-processing
 # -------------------------------------------------
-if run_clicked:
-    with st.spinner("Enriching companies…"):
-        enrichment_df = enrich_dataframe(
-            df=original_df,
-            website_column=website_col,
-            start_row=start_row,
-            end_row=end_row,
-            progress_cb=progress_cb,
-            checkpoint_path=checkpoint_path,
-        )
-
-# -------------------------------------------------
-# Post-processing (merge + save)
-# -------------------------------------------------
-if enrichment_df is not None:
-    progress_bar.progress(1.0)
-    status_text.success("Enrichment completed")
-
-    merged_df = append_enrichment_to_original_df(
-        original_df,
-        enrichment_df,
-    )
-
+if enrichment_df is not None and not enrichment_df.empty:
+    merged_df = append_enrichment_to_original_df(original_df, enrichment_df)
     merged_df.to_csv(output_path, index=False)
 
-    st.success(
-        "✅ Enrichment appended to original file and saved at:\n"
-        f"`{output_path}`"
-    )
-
     st.session_state["last_output_df"] = merged_df
-    st.session_state["last_enrichment_df"] = enrichment_df
     st.session_state["last_output_path"] = output_path
 
 # -------------------------------------------------
-# Step 5 — Results + Retry failed only
+# Step 5 — Results
 # -------------------------------------------------
 st.header("5️⃣ Results")
 
@@ -264,97 +238,52 @@ last_path = st.session_state.get("last_output_path")
 if last_df is None:
     latest_csv = latest_output_csv()
     if latest_csv:
-        try:
-            last_df = pd.read_csv(latest_csv)
-            last_path = latest_csv
-            st.session_state["last_output_df"] = last_df
-            st.session_state["last_output_path"] = last_path
-        except Exception:
-            last_df = None
+        last_df = pd.read_csv(latest_csv)
+        last_path = latest_csv
+        st.session_state["last_output_df"] = last_df
+        st.session_state["last_output_path"] = last_path
 
-if last_df is not None:
-    st.success(f"Loaded results from `{last_path}`")
-    st.dataframe(last_df, use_container_width=True)
+if last_df is None:
+    st.warning("No results available yet.")
+    st.stop()
 
-    # Download
-    st.subheader("Download merged file")
+st.success(f"Loaded results from `{last_path}`")
 
-    default_name = os.path.basename(last_path).replace(".csv", "")
-    custom_name = st.text_input(
-        "File name (without extension)",
-        value=default_name,
-    )
+# Phone progress widget
+received, total = phone_progress(last_df)
+if reveal_phone:
+    st.info(f"📞 Phone progress: **{received}/{total}** received")
 
-    st.download_button(
-        "⬇️ Download CSV",
-        data=last_df.to_csv(index=False),
-        file_name=f"{custom_name}.csv",
-        mime="text/csv",
-    )
+st.info(
+    "📞 **Phone numbers arrive asynchronously**\n\n"
+    "If you enabled phone enrichment, numbers may appear minutes later.\n"
+    "Click **Refresh phone numbers** to merge newly delivered phones into the file."
+)
 
-    st.info(
-        "📁 **Server-side storage**\n\n"
-        f"The merged file is stored on the machine running this app at:\n"
-        f"`{last_path}`\n\n"
-        "If this app runs remotely, download the file to keep a local copy."
-    )
+if st.button("🔄 Refresh phone numbers"):
+    refreshed_df = merge_phone_events_into_original_df(last_df)
+    refreshed_df.to_csv(last_path, index=False)
+    st.session_state["last_output_df"] = refreshed_df
+    last_df = refreshed_df
+    st.success("Phone numbers merged from webhook events.")
 
-    # Retry failed only
-    st.subheader("Retry failed only")
+st.dataframe(last_df, width="stretch")
 
-    retry_mask = last_df["apollo_status"].isin(
-        ["error", "no_enrich", "no_match"]
-    )
+st.subheader("Download merged file")
 
-    failed_count = int(retry_mask.sum())
+default_name = os.path.basename(last_path).replace(".csv", "")
+custom_name = st.text_input("File name (without extension)", value=default_name)
 
-    st.caption(f"Rows eligible for retry: **{failed_count}**")
+st.download_button(
+    "⬇️ Download CSV",
+    data=last_df.to_csv(index=False),
+    file_name=f"{custom_name}.csv",
+    mime="text/csv",
+)
 
-    if failed_count > 0:
-        retry_clicked = st.button("🔁 Retry failed rows only")
-
-        if retry_clicked:
-            retry_timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            retry_checkpoint = os.path.join(
-                OUTPUT_DIR, f"checkpoint_retry_{retry_timestamp}.json"
-            )
-            retry_output = os.path.join(
-                OUTPUT_DIR, f"enriched_retry_{retry_timestamp}.csv"
-            )
-
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-
-            def retry_progress(pct, msg):
-                progress_bar.progress(pct)
-                status_text.info(msg)
-
-            with st.spinner("Retrying failed rows…"):
-                retried_df = retry_failed_only(
-                    df_original=original_df,
-                    website_column=website_col,
-                    previous_output_df=last_df,
-                    progress_cb=retry_progress,
-                    checkpoint_path=retry_checkpoint,
-                )
-
-            merged_retry_df = append_enrichment_to_original_df(
-                original_df,
-                retried_df,
-            )
-
-            merged_retry_df.to_csv(retry_output, index=False)
-
-            progress_bar.progress(1.0)
-            status_text.success("Retry completed")
-
-            st.success(
-                "🔁 Retry results merged and saved at:\n"
-                f"`{retry_output}`"
-            )
-
-            st.session_state["last_output_df"] = merged_retry_df
-            st.session_state["last_output_path"] = retry_output
-
-else:
-    st.warning("No results available yet. Run enrichment first.")
+st.info(
+    "📁 **Server-side storage**\n\n"
+    f"The file is stored on the server at:\n"
+    f"`{last_path}`\n\n"
+    "Download it to keep a local copy."
+)
